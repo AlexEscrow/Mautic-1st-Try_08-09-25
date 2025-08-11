@@ -1,6 +1,7 @@
-name: Deploy to DigitalOcean
 permissions:
   contents: read
+name: Deploy to DigitalOcean
+
 on:
   push:
     branches:
