@@ -1,5 +1,7 @@
 permissions:
   contents: read
+  pull-requests: write
+  
 name: Deploy to DigitalOcean
 
 on:
