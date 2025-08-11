@@ -1,5 +1,6 @@
 name: Deploy to DigitalOcean
-
+permissions:
+  contents: read
 on:
   push:
     branches:
