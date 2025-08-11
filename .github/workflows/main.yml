@@ -1,0 +1,170 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Load .mautic_env variables
+      run: |
+        set -a
+        source .mautic_env
+        set +a
+        echo "MAUTIC_PORT=${MAUTIC_PORT}" >> $GITHUB_ENV
+
+    - name: Check EMAIL_ADDRESS environment variable
+      run: |
+        if [ -z "${EMAIL_ADDRESS}" ]; then
+          echo "Error: Missing required environment variable: EMAIL_ADDRESS"
+          exit 1
+        fi
+      env:
+        EMAIL_ADDRESS: ${{ vars.EMAIL_ADDRESS }}
+
+    - name: Check required secrets
+      env:
+        DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        DIGITALOCEAN_SSH_FINGERPRINT: ${{ secrets.DIGITALOCEAN_SSH_FINGERPRINT }}
+        MAUTIC_PASSWORD: ${{ secrets.MAUTIC_PASSWORD }}
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      run: |
+        error_missing_secrets=()
+        check_secret() {
+          if [ -z "${!1}" ]; then
+            error_missing_secrets+=("$1")
+          fi
+        }
+
+        check_secret "DIGITALOCEAN_ACCESS_TOKEN"
+        check_secret "DIGITALOCEAN_SSH_FINGERPRINT"
+        check_secret "MAUTIC_PASSWORD"
+        check_secret "SSH_PRIVATE_KEY"
+
+        if [ ${#error_missing_secrets[@]} -ne 0 ]; then
+          echo "Error: Missing required secrets: ${error_missing_secrets[*]}"
+          exit 1
+        fi
+
+    - name: Install doctl
+      uses: digitalocean/action-doctl@v2
+      with:
+        token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+    - name: Create VPS if it doesn't exist
+      run: |
+        if ! doctl compute droplet list | grep -q 'mautic-vps'; then
+          doctl compute droplet create mautic-vps --image docker-20-04 --size s-1vcpu-1gb --region nyc1 --ssh-keys ${{ secrets.DIGITALOCEAN_SSH_FINGERPRINT }} --wait --user-data-file setup-vps.sh --enable-monitoring
+          echo "droplet_created=true" >> $GITHUB_ENV
+        else
+          echo "Droplet 'mautic-vps' already exists."
+          echo "droplet_created=true" >> $GITHUB_ENV
+        fi
+
+    - name: Get VPS IP
+      run: |
+        echo "Waiting for droplet to be ready..."
+        while : ; do
+          echo "."
+          sleep 2
+          STATUS=$(doctl compute droplet get mautic-vps --format Status --no-header)
+          if [ "$STATUS" = "active" ]; then
+            IP=$(doctl compute droplet get mautic-vps --format PublicIPv4 --no-header)
+            if [ -n "$IP" ]; then
+              echo "Droplet is active. IP address: $IP"
+              break
+            fi
+          fi
+        done
+        echo "ip=$IP" >> $GITHUB_ENV
+
+    - name: Wait for server to be accessible
+      run: |
+        echo "Waiting for server at ${{ env.ip }} to be accessible..."
+        while : ; do
+          if nc -z ${{ env.ip }} 22; then
+            echo "Server is up and accessible."
+            break
+          else
+            echo "."
+            sleep 2
+          fi
+        done
+
+    - name: Prepare virtual server configuration
+      if: ${{ vars.DOMAIN }}
+      run: |
+        DOMAIN_IP=$(dig +short ${{ vars.DOMAIN }})
+        if [ "$DOMAIN_IP" == "${{ env.ip }}" ]; then
+          echo "Domain ${{ vars.DOMAIN }} correctly points to the droplet IP."
+          # Rename the nginx-virtual-host-template file
+          mv nginx-virtual-host-template "nginx-virtual-host-${{ vars.DOMAIN }}"
+          # Replace DOMAIN_NAME inside the file with the actual domain
+          sed -i "s/DOMAIN_NAME/${{ vars.DOMAIN }}/g" "nginx-virtual-host-${{ vars.DOMAIN }}"
+          sed -i "s/PORT/${{ env.MAUTIC_PORT }}/g" "nginx-virtual-host-${{ vars.DOMAIN }}"
+          cat nginx-virtual-host-${{ vars.DOMAIN }} # debug
+        else
+          echo "Error: Domain ${{ vars.DOMAIN }} does not point to the droplet IP."
+          echo "To configure your DNS settings, access your domain registrar's DNS management page. Locate the DNS settings or DNS management section. You should create or update an A record with the following details: Name: @ (or your subdomain, e.g., www if your domain is www.example.com), Type: A, Value: ${{ env.ip }}. This change will point ${{ vars.DOMAIN }} to the IP address ${{ env.ip }}. Note that DNS changes can take up to 48 hours to propagate globally."
+          exit 1
+        fi
+
+    - name: Prepare setup-dc.sh script
+      run: |
+        # Replace placeholders in setup-dc.sh
+        sed -i "s/{{IP_ADDRESS}}/${{ env.ip }}/g" setup-dc.sh
+        sed -i "s/{{PORT}}/${{ env.MAUTIC_PORT }}/g" setup-dc.sh
+        sed -i "s/{{EMAIL_ADDRESS}}/${{ env.EMAIL_ADDRESS }}/g" setup-dc.sh
+        sed -i "s/{{MAUTIC_PASSWORD}}/${{ secrets.MAUTIC_PASSWORD }}/g" setup-dc.sh
+        if [ ! -z "${{ env.DOMAIN }}" ]; then
+          sed -i "s/{{DOMAIN_NAME}}/${{ env.DOMAIN }}/g" setup-dc.sh
+        fi
+        cat setup-dc.sh # debug
+      env:
+        EMAIL_ADDRESS: ${{ vars.EMAIL_ADDRESS }}
+        DOMAIN: ${{ vars.DOMAIN }}
+
+    - name: Deploy to Server
+      uses: easingthemes/ssh-deploy@main
+      with:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        ARGS: "-rlgoDzvc"
+        SOURCE: "."
+        REMOTE_HOST: ${{ env.ip }}
+        REMOTE_USER: root
+        TARGET: /var/www
+        EXCLUDE: ".git"
+        SCRIPT_BEFORE: mkdir -p /var/www
+        SCRIPT_AFTER: /var/www/setup-dc.sh > /var/log/setup-dc.log 2>&1
+
+    - name: Open your Mautic instance
+      run: |
+        if [ -z "${DOMAIN}" ]; then
+          echo "You can visit the Mautic installation at http://${{ env.ip }}:${{ env.MAUTIC_PORT }}"
+        else
+          echo "You can visit the Mautic installation at http://${DOMAIN}"
+        fi
+      env:
+        DOMAIN: ${{ vars.DOMAIN }}
+
+    - name: Download setup-dc.log from Server
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@${{ env.ip }}:/var/log/setup-dc.log ./setup-dc.log
+        rm -f ~/.ssh/id_rsa
+      shell: bash
+
+    - name: Upload setup-dc.log as Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: setup-dc-log
+        path: ./setup-dc.log
