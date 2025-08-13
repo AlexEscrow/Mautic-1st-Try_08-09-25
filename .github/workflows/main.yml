@@ -72,22 +72,28 @@ jobs:
           echo "droplet_created=true" >> $GITHUB_ENV
         fi
 
-    - name: Get VPS IP
-      run: |
-        echo "Waiting for droplet to be ready..."
-        while : ; do
-          echo "."
-          sleep 2
-          STATUS=$(doctl compute droplet get mautic-vps --format Status --no-header)
-          if [ "$STATUS" = "active" ]; then
-            IP=$(doctl compute droplet get mautic-vps --format PublicIPv4 --no-header)
-            if [ -n "$IP" ]; then
-              echo "Droplet is active. IP address: $IP"
-              break
-            fi
-          fi
-        done
-        echo "ip=$IP" >> $GITHUB_ENV
+- name: Get VPS Reserved IP
+  run: |
+    echo Waiting for droplet to be ready...
+    while : ; do
+      echo .
+      sleep 2
+      STATUS=$(doctl compute droplet get mautic-vps --format Status --no-header)
+      if [ "$STATUS" = "active" ]; then
+        # Check for a reserved IP assigned to the droplet
+        RESERVED_IP=$(doctl compute reserved-ip list --format "DropletName,IP" --no-header | grep "mautic-vps" | awk '{print $NF}')  # Changed command
+
+        if [ -n "$RESERVED_IP" ]; then
+          echo Droplet is active and has a Reserved IP. Reserved IP address: "$RESERVED_IP"
+          IP="$RESERVED_IP" # Set IP variable to the reserved IP
+          break
+        else
+          echo "Droplet is active but doesn't have a Reserved IP assigned yet." # Added else condition
+        fi
+      fi
+    done
+    echo "ip=$IP" >> "$GITHUB_ENV"
+
 
     - name: Wait for server to be accessible
       run: |
