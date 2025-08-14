@@ -1,116 +1,100 @@
-name: Full Mautic Deployment
-
-on:
-  push:
-    branches:
-      - main
-
-env:
-  IP: 138.197.199.81
-  MAUTIC_PORT: 8001
-  EMAIL_ADDRESS: ContactUs+AutoCreatedAdmin@CallThatAgent.com
-  DOMAIN: engine.call-that.com
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Save SSH key
-        run: |
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
-
       - name: Deploy and setup Mautic on VPS
         run: |
           ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key root@${{ env.IP }} bash -s <<'EOF'
-          
-          # Navigate to deployment folder
-          cd /var/www || mkdir -p /var/www && cd /var/www
+export MAUTIC_PASSWORD="${MAUTIC_PASSWORD}"
+export EMAIL_ADDRESS="${EMAIL_ADDRESS}"
+export DOMAIN="${DOMAIN}"
+export IP="${IP}"
+export MAUTIC_PORT="${MAUTIC_PORT}"
 
-          # Pull or clone repo
-          if [ ! -d .git ]; then
-              git clone https://github.com/${GITHUB_REPOSITORY}.git .
-          else
-              git reset --hard
-              git pull
-          fi
+cd /var/www || mkdir -p /var/www && cd /var/www
 
-          # Check that domain points to this VPS
-          DOMAIN_IP=$(dig +short $DOMAIN)
-          DROPLET_IP=$(curl -s http://icanhazip.com)
-          echo "Droplet IP: $DROPLET_IP, DOMAIN IP: $DOMAIN_IP"
-          if [ "$DOMAIN_IP" != "$DROPLET_IP" ]; then
-              echo "ERROR: $DOMAIN does not point to this server."
-              exit 1
-          fi
-          echo "✅ Domain check passed"
+# Pull or clone repo
+if [ ! -d .git ]; then
+    git clone https://github.com/${GITHUB_REPOSITORY}.git .
+else
+    git reset --hard
+    git pull
+fi
 
-          # Build and start Docker containers
-          docker compose build
-          docker compose up -d db --wait && docker compose up -d mautic_web --wait
+# Check that domain points to this VPS
+DOMAIN_IP=$(dig +short $DOMAIN)
+DROPLET_IP=$(curl -s http://icanhazip.com)
+echo "Droplet IP: $DROPLET_IP, DOMAIN IP: $DOMAIN_IP"
+if [ "$DOMAIN_IP" != "$DROPLET_IP" ]; then
+    echo "ERROR: $DOMAIN does not point to this server."
+    exit 1
+fi
+echo "✅ Domain check passed"
 
-          # Wait for db to be ready
-          until docker exec basic-mautic_db-1 pg_isready -U postgres >/dev/null 2>&1; do
-              echo "Waiting for DB..."
-              sleep 2
-          done
+# Build and start Docker containers
+docker compose build
+docker compose up -d db --wait && docker compose up -d mautic_web --wait
 
-          # Wait for mautic_web container
-          until docker exec basic-mautic_web-1 sh -c 'echo "Container running"'; do
-              echo "Waiting for mautic_web..."
-              sleep 2
-          done
+# Wait for db to be ready
+until docker exec basic-mautic_db-1 pg_isready -U postgres >/dev/null 2>&1; do
+    echo "Waiting for DB..."
+    sleep 2
+done
 
-          # Install Mautic with retries
-          MAX_RETRIES=5
-          RETRY_COUNT=0
-          SUCCESS=0
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              echo "Attempt $((RETRY_COUNT+1)) to install Mautic..."
-              if docker compose exec -T -u www-data -w /var/www/html mautic_web php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password $MAUTIC_PASSWORD http://$IP:$MAUTIC_PORT; then
-                  SUCCESS=1
-                  break
-              else
-                  echo "Install failed, retrying..."
-                  sleep 10
-                  RETRY_COUNT=$((RETRY_COUNT+1))
-              fi
-          done
-          if [ $SUCCESS -eq 0 ]; then
-              echo "ERROR: Mautic installation failed."
-              exit 1
-          fi
+# Wait for mautic_web container
+until docker exec basic-mautic_web-1 sh -c 'echo "Container running"'; do
+    echo "Waiting for mautic_web..."
+    sleep 2
+done
 
-          # Start all containers
-          docker compose up -d
+# Install Mautic with retries
+MAX_RETRIES=5
+RETRY_COUNT=0
+SUCCESS=0
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "Attempt $((RETRY_COUNT+1)) to install Mautic..."
+    if docker compose exec -T -u www-data -w /var/www/html mautic_web php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password $MAUTIC_PASSWORD http://$IP:$MAUTIC_PORT; then
+        SUCCESS=1
+        break
+    else
+        echo "Install failed, retrying..."
+        sleep 10
+        RETRY_COUNT=$((RETRY_COUNT+1))
+    fi
+done
+if [ $SUCCESS -eq 0 ]; then
+    echo "ERROR: Mautic installation failed."
+    exit 1
+fi
 
-          # Configure Nginx
-          SOURCE_PATH="/var/www/nginx-virtual-host-$DOMAIN"
-          TARGET_PATH="/etc/nginx/sites-enabled/nginx-virtual-host-$DOMAIN"
-          [ -L "$TARGET_PATH" ] && rm $TARGET_PATH
-          ln -s $SOURCE_PATH $TARGET_PATH
+# Start all containers
+docker compose up -d
 
-          nginx -t
-          if ! pgrep -x nginx >/dev/null; then
-              systemctl start nginx
-          else
-              nginx -s reload
-          fi
+# Configure Nginx
+SOURCE_PATH="/var/www/nginx-virtual-host-$DOMAIN"
+TARGET_PATH="/etc/nginx/sites-enabled/nginx-virtual-host-$DOMAIN"
+[ -L "$TARGET_PATH" ] && rm $TARGET_PATH
+ln -s $SOURCE_PATH $TARGET_PATH
 
-          # Obtain SSL certificate
-          certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL_ADDRESS
+nginx -t
+if ! pgrep -x nginx >/dev/null; then
+    systemctl start nginx
+else
+    nginx -s reload
+fi
 
-          # Ensure certbot renew cron job
-          if ! crontab -l | grep -q 'certbot renew'; then
-              (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
-          fi
+# Obtain SSL certificate
+certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL_ADDRESS
 
-          # Update Mautic site_url to HTTPS
-          docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
+# Ensure certbot renew cron job
+if ! crontab -l | grep -q 'certbot renew'; then
+    (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
+fi
 
-          echo "✅ Deployment completed successfully"
+# Update Mautic site_url to HTTPS
+docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
+
+echo "✅ Deployment completed successfully"
 EOF
+        env:
+          MAUTIC_PASSWORD: ${{ secrets.MAUTIC_PASSWORD }}
+          EMAIL_ADDRESS: ${{ env.EMAIL_ADDRESS }}
+          DOMAIN: ${{ env.DOMAIN }}
+          IP: ${{ env.IP }}
+          MAUTIC_PORT: ${{ env.MAUTIC_PORT }}
