@@ -1,85 +1,50 @@
-name: Mautic Quick Deploy
-
-on:
-  push:
-    branches:
-      - main
-
-env:
-  IP: 138.197.199.81
-  MAUTIC_PORT: 8001
-  EMAIL_ADDRESS: ContactUs+AutoCreatedAdmin@CallThatAgent.com
-  DOMAIN: engine.call-that.com
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Deploy & Setup Mautic
+      - name: Deploy & setup Mautic on VPS
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ env.IP }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
           script: |
             cd /var/www
             echo "✅ Skipping domain IP check for CI/CD deployment"
 
-            docker compose build
-            docker compose up -d db mautic_web
+            # Docker Compose build and up
+            docker-compose build
+            docker-compose up -d db mautic_web
 
-            DB=$(docker compose ps -q db)
-            WEB=$(docker compose ps -q mautic_web)
+            DB=$(docker-compose ps -q db)
+            WEB=$(docker-compose ps -q mautic_web)
 
-            until docker exec $DB pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
-            until docker exec $WEB sh -c 'echo Running'; do sleep 2; done
+            echo "⏳ Waiting for containers to be ready..."
+            docker exec $DB pg_isready -U postgres
+            sleep 5  # short wait after DB ready
+            docker exec $WEB sh -c 'echo Running'
+            sleep 2  # short wait after web ready
 
             # Mautic install with retries
-            MAX_RETRIES=5
-            RETRY_COUNT=0
-            SUCCESS=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-                echo "Attempt $((RETRY_COUNT+1)) to install Mautic..."
-                if docker compose exec -T -u www-data -w /var/www/html $WEB php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password $MAUTIC_PASSWORD http://$IP:$MAUTIC_PORT; then
-                    SUCCESS=1
-                    break
-                else
-                    echo "Install failed, retrying in 10s..."
-                    sleep 10
-                    RETRY_COUNT=$((RETRY_COUNT+1))
-                fi
+            for i in {1..5}; do
+              echo "Attempt $i to install Mautic..."
+              if docker-compose exec -T -u www-data -w /var/www/html $WEB php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password $MAUTIC_PASSWORD http://$IP:$MAUTIC_PORT; then
+                echo "✅ Mautic installed successfully!"
+                break
+              else
+                echo "Install failed, retrying in 10s..."
+                sleep 10
+              fi
             done
 
-            if [ $SUCCESS -eq 0 ]; then
-                echo "ERROR: Mautic installation failed after $MAX_RETRIES attempts."
-                exit 1
-            fi
+            docker-compose up -d
 
-            docker compose up -d
-
+            # Nginx & HTTPS setup
             ln -sf /var/www/nginx-virtual-host-$DOMAIN /etc/nginx/sites-enabled/
             nginx -t && (systemctl start nginx || nginx -s reload)
             certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL_ADDRESS
             (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
 
-            # Update site_url with retries
-            MAX_RETRIES=30
-            RETRY_COUNT=0
-            echo "Waiting for Mautic to respond at https://$DOMAIN..."
-            until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-                RETRY_COUNT=$((RETRY_COUNT+1))
-                echo "Waiting for Mautic to respond ($RETRY_COUNT/$MAX_RETRIES)..."
-                sleep 5
-            done
+            # Update site_url
+            echo "⏳ Waiting for Mautic to respond..."
+            until curl -ks https://$DOMAIN | grep -q "Mautic"; do sleep 5; done
 
-            if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-                echo "ERROR: Mautic not responding at https://$DOMAIN after waiting."
-                exit 1
-            fi
-
-            docker compose exec -T $WEB sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
-
+            docker-compose exec -T $WEB sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
             echo "✅ Deployment complete!"
