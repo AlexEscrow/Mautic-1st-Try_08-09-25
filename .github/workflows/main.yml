@@ -142,7 +142,10 @@ jobs:
         TARGET: /var/www
         EXCLUDE: ".git"
         SCRIPT_BEFORE: mkdir -p /var/www
-        SCRIPT_AFTER: /var/www/setup-dc.sh > /var/log/setup-dc.log 2>&1
+        SCRIPT_AFTER: |
+          sed -i 's/docker compose/docker-compose/g' /var/www/setup-dc.sh
+          sed -i 's/docker exec -T/docker exec -i/g' /var/www/setup-dc.sh
+          /var/www/setup-dc.sh > /var/log/setup-dc.log 2>&1
 
     - name: Open your Mautic instance
       run: |
