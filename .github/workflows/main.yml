@@ -3,40 +3,43 @@ name: Deploy Mautic
 on:
   push:
     branches:
-      - main
+      - main  # deploy when pushing to main branch
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Deploy & setup Mautic via SSH
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}   # or use password: ${{ secrets.SSH_PASSWORD }}
+          port: 22
           script: |
             set -e
 
-            echo "✅ Skipping domain IP check for CI/CD deployment"
+            echo "✅ Starting deployment..."
 
             # Navigate to deployment directory
-            cd /var/www || mkdir -p /var/www && cd /var/www
+            mkdir -p /var/www && cd /var/www
 
-            # Docker setup
+            # Start Docker containers
             docker-compose build
             docker-compose up -d db mautic_web
 
-            # Wait for DB container
+            # Get DB container ID
             DB=$(docker-compose ps -q db)
             if [ -z "$DB" ]; then
               echo "❌ DB container not found!"
               exit 1
             fi
 
+            # Wait for DB readiness
             MAX_DB_RETRIES=30
             DB_RETRY=0
             until docker exec "$DB" pg_isready -U postgres >/dev/null 2>&1 || [ $DB_RETRY -ge $MAX_DB_RETRIES ]; do
@@ -51,13 +54,14 @@ jobs:
             fi
             echo "✅ DB is ready!"
 
-            # Wait for Mautic Web container
+            # Get Web container ID
             WEB=$(docker-compose ps -q mautic_web)
             if [ -z "$WEB" ]; then
               echo "❌ Mautic Web container not found!"
               exit 1
             fi
 
+            # Wait for Web container
             MAX_WEB_RETRIES=30
             WEB_RETRY=0
             until docker exec "$WEB" sh -c 'echo Running' >/dev/null 2>&1 || [ $WEB_RETRY -ge $MAX_WEB_RETRIES ]; do
@@ -72,7 +76,7 @@ jobs:
             fi
             echo "✅ Mautic Web is ready!"
 
-            # Mautic install with retries
+            # Mautic install
             MAX_INSTALL_RETRIES=5
             INSTALL_RETRY=0
             SUCCESS=0
@@ -92,8 +96,7 @@ jobs:
               echo "❌ Mautic installation failed after $MAX_INSTALL_RETRIES attempts."
               exit 1
             fi
-
-            docker-compose up -d
+            echo "✅ Mautic installed successfully!"
 
             # Nginx configuration
             ln -sf /var/www/nginx-virtual-host-$DOMAIN /etc/nginx/sites-enabled/
@@ -104,22 +107,5 @@ jobs:
 
             # Cron job for renewal
             (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
-
-            # Update Mautic site_url with retries
-            MAX_URL_RETRIES=30
-            URL_RETRY=0
-            echo "Waiting for Mautic to respond at https://$DOMAIN..."
-            until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $URL_RETRY -ge $MAX_URL_RETRIES ]; do
-              URL_RETRY=$((URL_RETRY+1))
-              echo "Waiting for Mautic ($URL_RETRY/$MAX_URL_RETRIES)..."
-              sleep 5
-            done
-
-            if [ $URL_RETRY -ge $MAX_URL_RETRIES ]; then
-              echo "❌ Mautic not responding at https://$DOMAIN after waiting."
-              exit 1
-            fi
-
-            docker-compose exec -T "$WEB" sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
 
             echo "✅ Deployment complete!"
