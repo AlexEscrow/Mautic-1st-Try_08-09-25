@@ -1,77 +1,99 @@
-name: Full Mautic Deployment
+name: Deploy Mautic
 
 on:
   push:
     branches:
       - main
 
-env:
-  IP: 138.197.199.81
-  MAUTIC_PORT: 8001
-  EMAIL_ADDRESS: ContactUs+AutoCreatedAdmin@CallThatAgent.com
-  DOMAIN: engine.call-that.com
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Deploy & Setup Mautic on VPS
+      - name: Deploy & setup Mautic via SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
-          host: ${{ env.IP }}
-          username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: 22
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
           script: |
+            set -e
+
             echo "✅ Skipping domain IP check for CI/CD deployment"
 
             # Navigate to deployment directory
             cd /var/www || mkdir -p /var/www && cd /var/www
 
             # Docker setup
-            docker compose build
-            docker compose up -d db mautic_web
+            docker-compose build
+            docker-compose up -d db mautic_web
 
             # Wait for DB container
-            DB=$(docker compose ps -q db)
-            until docker exec "$DB" pg_isready -U postgres >/dev/null 2>&1; do
-              echo "Waiting for DB..."
+            DB=$(docker-compose ps -q db)
+            if [ -z "$DB" ]; then
+              echo "❌ DB container not found!"
+              exit 1
+            fi
+
+            MAX_DB_RETRIES=30
+            DB_RETRY=0
+            until docker exec "$DB" pg_isready -U postgres >/dev/null 2>&1 || [ $DB_RETRY -ge $MAX_DB_RETRIES ]; do
+              echo "Waiting for DB ($((DB_RETRY+1))/$MAX_DB_RETRIES)..."
               sleep 2
+              DB_RETRY=$((DB_RETRY+1))
             done
 
-            # Wait for Mautic web container
-            WEB=$(docker compose ps -q mautic_web)
-            until docker exec "$WEB" sh -c 'echo Running'; do
-              echo "Waiting for Mautic Web..."
+            if [ $DB_RETRY -ge $MAX_DB_RETRIES ]; then
+              echo "❌ DB not ready after $MAX_DB_RETRIES attempts."
+              exit 1
+            fi
+            echo "✅ DB is ready!"
+
+            # Wait for Mautic Web container
+            WEB=$(docker-compose ps -q mautic_web)
+            if [ -z "$WEB" ]; then
+              echo "❌ Mautic Web container not found!"
+              exit 1
+            fi
+
+            MAX_WEB_RETRIES=30
+            WEB_RETRY=0
+            until docker exec "$WEB" sh -c 'echo Running' >/dev/null 2>&1 || [ $WEB_RETRY -ge $MAX_WEB_RETRIES ]; do
+              echo "Waiting for Mautic Web ($((WEB_RETRY+1))/$MAX_WEB_RETRIES)..."
               sleep 2
+              WEB_RETRY=$((WEB_RETRY+1))
             done
+
+            if [ $WEB_RETRY -ge $MAX_WEB_RETRIES ]; then
+              echo "❌ Mautic Web not ready after $MAX_WEB_RETRIES attempts."
+              exit 1
+            fi
+            echo "✅ Mautic Web is ready!"
 
             # Mautic install with retries
-            MAX_RETRIES=5
-            RETRY_COUNT=0
+            MAX_INSTALL_RETRIES=5
+            INSTALL_RETRY=0
             SUCCESS=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              echo "Attempt $((RETRY_COUNT+1)) to install Mautic..."
-              if docker compose exec -T -u www-data -w /var/www/html "$WEB" php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password ${{ secrets.MAUTIC_PASSWORD }} http://$IP:$MAUTIC_PORT; then
+            while [ $INSTALL_RETRY -lt $MAX_INSTALL_RETRIES ]; do
+              echo "Attempt $((INSTALL_RETRY+1)) to install Mautic..."
+              if docker-compose exec -T -u www-data -w /var/www/html "$WEB" php ./bin/console mautic:install --force --admin_email "$EMAIL_ADDRESS" --admin_password "$MAUTIC_PASSWORD" http://$IP:$MAUTIC_PORT; then
                 SUCCESS=1
                 break
               else
                 echo "Install failed, retrying in 10s..."
                 sleep 10
-                RETRY_COUNT=$((RETRY_COUNT+1))
+                INSTALL_RETRY=$((INSTALL_RETRY+1))
               fi
             done
 
             if [ $SUCCESS -eq 0 ]; then
-              echo "❌ Mautic installation failed after $MAX_RETRIES attempts."
+              echo "❌ Mautic installation failed after $MAX_INSTALL_RETRIES attempts."
               exit 1
             fi
 
-            docker compose up -d
+            docker-compose up -d
 
             # Nginx configuration
             ln -sf /var/www/nginx-virtual-host-$DOMAIN /etc/nginx/sites-enabled/
@@ -84,20 +106,20 @@ jobs:
             (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
 
             # Update Mautic site_url with retries
-            MAX_RETRIES=30
-            RETRY_COUNT=0
+            MAX_URL_RETRIES=30
+            URL_RETRY=0
             echo "Waiting for Mautic to respond at https://$DOMAIN..."
-            until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-              RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "Waiting for Mautic ($RETRY_COUNT/$MAX_RETRIES)..."
+            until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $URL_RETRY -ge $MAX_URL_RETRIES ]; do
+              URL_RETRY=$((URL_RETRY+1))
+              echo "Waiting for Mautic ($URL_RETRY/$MAX_URL_RETRIES)..."
               sleep 5
             done
 
-            if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+            if [ $URL_RETRY -ge $MAX_URL_RETRIES ]; then
               echo "❌ Mautic not responding at https://$DOMAIN after waiting."
               exit 1
             fi
 
-            docker compose exec -T "$WEB" sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
+            docker-compose exec -T "$WEB" sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
 
             echo "✅ Deployment complete!"
