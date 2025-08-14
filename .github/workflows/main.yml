@@ -1,3 +1,24 @@
+name: Full Mautic Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IP: 138.197.199.81
+  MAUTIC_PORT: 8001
+  EMAIL_ADDRESS: ContactUs+AutoCreatedAdmin@CallThatAgent.com
+  DOMAIN: engine.call-that.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
       - name: Deploy and setup Mautic on VPS
         run: |
           ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key root@${{ env.IP }} bash -s <<'EOF'
@@ -9,35 +30,25 @@ export MAUTIC_PORT="${MAUTIC_PORT}"
 
 cd /var/www || mkdir -p /var/www && cd /var/www
 
-# Pull or clone repo
-if [ ! -d .git ]; then
-    git clone https://github.com/${GITHUB_REPOSITORY}.git .
-else
+# If repo exists, reset & pull, else clone
+if [ -d .git ]; then
     git reset --hard
     git pull
+else
+    git clone https://github.com/${GITHUB_REPOSITORY}.git .
 fi
-
-# Check that domain points to this VPS
-DOMAIN_IP=$(dig +short $DOMAIN)
-DROPLET_IP=$(curl -s http://icanhazip.com)
-echo "Droplet IP: $DROPLET_IP, DOMAIN IP: $DOMAIN_IP"
-if [ "$DOMAIN_IP" != "$DROPLET_IP" ]; then
-    echo "ERROR: $DOMAIN does not point to this server."
-    exit 1
-fi
-echo "✅ Domain check passed"
 
 # Build and start Docker containers
 docker compose build
 docker compose up -d db --wait && docker compose up -d mautic_web --wait
 
-# Wait for db to be ready
+# Wait for DB
 until docker exec basic-mautic_db-1 pg_isready -U postgres >/dev/null 2>&1; do
     echo "Waiting for DB..."
     sleep 2
 done
 
-# Wait for mautic_web container
+# Wait for Mautic web container
 until docker exec basic-mautic_web-1 sh -c 'echo "Container running"'; do
     echo "Waiting for mautic_web..."
     sleep 2
@@ -63,7 +74,6 @@ if [ $SUCCESS -eq 0 ]; then
     exit 1
 fi
 
-# Start all containers
 docker compose up -d
 
 # Configure Nginx
@@ -98,3 +108,22 @@ EOF
           DOMAIN: ${{ env.DOMAIN }}
           IP: ${{ env.IP }}
           MAUTIC_PORT: ${{ env.MAUTIC_PORT }}
+
+      - name: Verify Mautic HTTPS is up
+        run: |
+          DOMAIN=${{ env.DOMAIN }}
+          MAX_RETRIES=30
+          RETRY_COUNT=0
+          echo "Waiting for Mautic at https://$DOMAIN..."
+          until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "Waiting ($RETRY_COUNT/$MAX_RETRIES)..."
+              sleep 5
+          done
+
+          if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+              echo "ERROR: Mautic not responding at https://$DOMAIN"
+              exit 1
+          fi
+
+          echo "✅ Mautic is live at https://$DOMAIN"
