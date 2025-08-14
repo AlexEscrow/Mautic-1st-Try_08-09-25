@@ -19,15 +19,15 @@ cd /var/www
 # Build & start database & web containers
 # -----------------------------
 docker compose build
-docker compose up -d db --wait
-docker compose up -d mautic_web --wait
+docker compose up -d db
+docker compose up -d mautic_web
 
 # -----------------------------
 # Wait for mautic_web container to be fully running
 # -----------------------------
 echo "## Waiting for basic-mautic_web-1 to be ready..."
-while ! docker exec basic-mautic_web-1 sh -c 'echo "Container running"' >/dev/null 2>&1; do
-    echo "### Waiting..."
+until docker exec basic-mautic_web-1 sh -c 'echo "Container running"' >/dev/null 2>&1; do
+    echo "### Waiting for mautic_web..."
     sleep 2
 done
 
@@ -73,5 +73,36 @@ if [[ "$DOMAIN" != "" && "$DOMAIN" != "DOMAIN_NAME" ]]; then
         exit 1
     fi
 
-    echo "## Configuring Nginx for $DOMAIN
+    echo "## Configuring Nginx for $DOMAIN..."
+    SOURCE_PATH="/var/www/nginx-virtual-host-$DOMAIN"
+    TARGET_PATH="/etc/nginx/sites-enabled/nginx-virtual-host-$DOMAIN"
+
+    [ -L "$TARGET_PATH" ] && rm "$TARGET_PATH"
+    ln -s "$SOURCE_PATH" "$TARGET_PATH"
+
+    nginx -t
+    if ! pgrep -x nginx >/dev/null; then
+        systemctl start nginx || nginx
+    else
+        nginx -s reload
+    fi
+
+    # -----------------------------
+    # Let's Encrypt SSL
+    # -----------------------------
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL_ADDRESS"
+
+    # Cron for renewal
+    if ! crontab -l | grep -q 'certbot renew'; then
+        (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'nginx -s reload'") | crontab -
+    fi
+
+    # Update Mautic site_url
+    if docker compose exec -T mautic_web test -f /var/www/html/config/local.php && \
+       docker compose exec -T mautic_web grep -q "site_url" /var/www/html/config/local.php; then
+        docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
+    fi
+fi
+
+echo "## Setup completed successfully!"
 
