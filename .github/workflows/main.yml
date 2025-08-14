@@ -170,12 +170,21 @@ jobs:
       run: |
         echo "Waiting for setup script to complete..."
         sleep 60
+        
+        # Create SSH key for connection
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_rsa root@${{ env.ip }} "
           echo 'Checking setup progress...'
           tail -20 /var/log/setup-dc.log
           echo '--- Container Status ---'
           docker ps
         "
+        
+        # Clean up SSH key
+        rm -f ~/.ssh/id_rsa
       shell: bash
 
     - name: Run Setup Script
