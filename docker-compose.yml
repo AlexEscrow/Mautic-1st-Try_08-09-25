@@ -1,0 +1,54 @@
+version: '3.9'
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: basic-mautic_db-1
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: your_root_password
+      MYSQL_DATABASE: mautic
+      MYSQL_USER: mautic
+      MYSQL_PASSWORD: mautic_password
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+
+  mautic_web:
+    image: mautic/mautic:latest
+    container_name: basic-mautic_web-1
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      MAUTIC_DB_HOST: db
+      MAUTIC_DB_USER: mautic
+      MAUTIC_DB_PASSWORD: mautic_password
+      MAUTIC_DB_NAME: mautic
+    volumes:
+      - /var/www:/var/www
+      - /var/run/docker.sock:/var/run/docker.sock   # <-- allows docker commands
+      - ./nginx-virtual-host:/etc/nginx/sites-enabled  # if you manage nginx configs
+    ports:
+      - "8001:80"
+
+  mautic_worker:
+    image: mautic/mautic:latest
+    container_name: basic-mautic_worker-1
+    restart: unless-stopped
+    depends_on:
+      - db
+      - mautic_web
+    command: php /var/www/html/bin/console mautic:segments:update && php /var/www/html/bin/console mautic:campaigns:update
+    volumes:
+      - /var/www:/var/www
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      MAUTIC_DB_HOST: db
+      MAUTIC_DB_USER: mautic
+      MAUTIC_DB_PASSWORD: mautic_password
+      MAUTIC_DB_NAME: mautic
+
+volumes:
+  db_data:
