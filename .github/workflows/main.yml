@@ -19,107 +19,98 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Deploy & setup Mautic on VPS with rollback
+      - name: Save SSH key
         run: |
-          # Save SSH key to temp file
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
 
+      - name: Deploy and setup Mautic on VPS
+        run: |
           ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key root@${{ env.IP }} bash -s <<'EOF'
-            set -e
-            echo "✅ Connected via SSH"
+          
+          # Navigate to deployment folder
+          cd /var/www || mkdir -p /var/www && cd /var/www
 
-            cd /var/www
-
-            # Backup current docker-compose state
-            if [ -d "./backup" ]; then rm -rf ./backup; fi
-            mkdir ./backup
-            docker compose down
-            tar czf ./backup/mautic_backup_$(date +%F_%H-%M-%S).tar.gz ./html ./docker-compose.yml
-
-            echo "✅ Backup created"
-
-            # Pull latest code
-            if [ ! -d ".git" ]; then
+          # Pull or clone repo
+          if [ ! -d .git ]; then
               git clone https://github.com/${GITHUB_REPOSITORY}.git .
-            else
-              git fetch --all
-              git reset --hard origin/main
-            fi
+          else
+              git reset --hard
+              git pull
+          fi
 
-            # Pull latest Docker images
-            docker compose pull
+          # Check that domain points to this VPS
+          DOMAIN_IP=$(dig +short $DOMAIN)
+          DROPLET_IP=$(curl -s http://icanhazip.com)
+          echo "Droplet IP: $DROPLET_IP, DOMAIN IP: $DOMAIN_IP"
+          if [ "$DOMAIN_IP" != "$DROPLET_IP" ]; then
+              echo "ERROR: $DOMAIN does not point to this server."
+              exit 1
+          fi
+          echo "✅ Domain check passed"
 
-            # Build and start Docker containers
-            docker compose build
-            docker compose up -d db --wait && docker compose up -d mautic_web --wait
+          # Build and start Docker containers
+          docker compose build
+          docker compose up -d db --wait && docker compose up -d mautic_web --wait
 
-            # Wait for db and web containers
-            until docker exec basic-mautic_db-1 pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
-            until docker exec basic-mautic_web-1 sh -c 'echo "Container running"'; do sleep 2; done
+          # Wait for db to be ready
+          until docker exec basic-mautic_db-1 pg_isready -U postgres >/dev/null 2>&1; do
+              echo "Waiting for DB..."
+              sleep 2
+          done
 
-            # Install Mautic with retry
-            MAX_RETRIES=5
-            RETRY_COUNT=0
-            SUCCESS=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          # Wait for mautic_web container
+          until docker exec basic-mautic_web-1 sh -c 'echo "Container running"'; do
+              echo "Waiting for mautic_web..."
+              sleep 2
+          done
+
+          # Install Mautic with retries
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          SUCCESS=0
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              echo "Attempt $((RETRY_COUNT+1)) to install Mautic..."
               if docker compose exec -T -u www-data -w /var/www/html mautic_web php ./bin/console mautic:install --force --admin_email $EMAIL_ADDRESS --admin_password $MAUTIC_PASSWORD http://$IP:$MAUTIC_PORT; then
-                SUCCESS=1
-                break
+                  SUCCESS=1
+                  break
               else
-                sleep 10
-                RETRY_COUNT=$((RETRY_COUNT+1))
+                  echo "Install failed, retrying..."
+                  sleep 10
+                  RETRY_COUNT=$((RETRY_COUNT+1))
               fi
-            done
-
-            if [ $SUCCESS -eq 0 ]; then
-              echo "⚠️ Install failed, restoring backup..."
-              tar xzf ./backup/mautic_backup_*.tar.gz -C ./
-              docker compose up -d
+          done
+          if [ $SUCCESS -eq 0 ]; then
+              echo "ERROR: Mautic installation failed."
               exit 1
-            fi
+          fi
 
-            # Start all containers
-            docker compose up -d
+          # Start all containers
+          docker compose up -d
 
-            # Configure Nginx & HTTPS
-            DOMAIN=$DOMAIN
-            SOURCE_PATH="/var/www/nginx-virtual-host-$DOMAIN"
-            TARGET_PATH="/etc/nginx/sites-enabled/nginx-virtual-host-$DOMAIN"
-            if [ -L "$TARGET_PATH" ]; then rm $TARGET_PATH; fi
-            ln -s $SOURCE_PATH $TARGET_PATH
+          # Configure Nginx
+          SOURCE_PATH="/var/www/nginx-virtual-host-$DOMAIN"
+          TARGET_PATH="/etc/nginx/sites-enabled/nginx-virtual-host-$DOMAIN"
+          [ -L "$TARGET_PATH" ] && rm $TARGET_PATH
+          ln -s $SOURCE_PATH $TARGET_PATH
 
-            nginx -t
-            if ! pgrep -x nginx > /dev/null; then
+          nginx -t
+          if ! pgrep -x nginx >/dev/null; then
               systemctl start nginx
-            else
+          else
               nginx -s reload
-            fi
+          fi
 
-            certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL_ADDRESS
-            if ! crontab -l | grep -q 'certbot renew'; then
+          # Obtain SSL certificate
+          certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL_ADDRESS
+
+          # Ensure certbot renew cron job
+          if ! crontab -l | grep -q 'certbot renew'; then
               (crontab -l 2>/dev/null; echo "0 0 1 * * certbot renew --post-hook 'systemctl reload nginx'") | crontab -
-            fi
+          fi
 
-            # Wait for HTTPS Mautic
-            MAX_RETRIES=30
-            RETRY_COUNT=0
-            until curl -ks https://$DOMAIN | grep -q "Mautic" || [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
-              RETRY_COUNT=$((RETRY_COUNT+1))
-              sleep 5
-            done
+          # Update Mautic site_url to HTTPS
+          docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
 
-            if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-              echo "⚠️ Mautic HTTPS not responding, restoring backup..."
-              tar xzf ./backup/mautic_backup_*.tar.gz -C ./
-              docker compose up -d
-              exit 1
-            fi
-
-            # Update site_url
-            docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
-
-            echo "✅ Mautic deployment complete!"
+          echo "✅ Deployment completed successfully"
 EOF
-        env:
-          MAUTIC_PASSWORD: ${{ secrets.MAUTIC_PASSWORD }}
