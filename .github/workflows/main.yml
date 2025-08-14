@@ -135,7 +135,7 @@ jobs:
       uses: easingthemes/ssh-deploy@main
       with:
         SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        ARGS: "-rlgoDzvc"
+        ARGS: "-rlgoDzvc --delete"
         SOURCE: "."
         REMOTE_HOST: ${{ env.ip }}
         REMOTE_USER: root
@@ -143,9 +143,48 @@ jobs:
         EXCLUDE: ".git"
         SCRIPT_BEFORE: mkdir -p /var/www
         SCRIPT_AFTER: |
+          # Handle the mautic file/directory conflict
+          if [ -f "/var/www/mautic" ]; then
+            mkdir -p /var/www/cron
+            mv /var/www/mautic /var/www/cron/mautic_crontab
+          fi
+          
+          # Create required directories
+          mkdir -p /var/www/mautic/config
+          mkdir -p /var/www/mautic/logs
+          mkdir -p /var/www/mautic/media/files
+          mkdir -p /var/www/mautic/media/images
+          mkdir -p /var/www/cron
+          
+          # Set permissions
+          chown -R www-data:www-data /var/www/mautic/
+          chmod -R 755 /var/www/mautic/ /var/www/cron/
+          
+          # Fix Docker Compose syntax and run in background
           sed -i 's/docker compose/docker-compose/g' /var/www/setup-dc.sh
           sed -i 's/docker exec -T/docker exec -i/g' /var/www/setup-dc.sh
-          /var/www/setup-dc.sh > /var/log/setup-dc.log 2>&1
+          nohup /var/www/setup-dc.sh > /var/log/setup-dc.log 2>&1 &
+          echo "Setup script started in background"
+
+    - name: Wait for Setup Completion
+      run: |
+        echo "Waiting for setup script to complete..."
+        sleep 60
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_rsa root@${{ env.ip }} "
+          echo 'Checking setup progress...'
+          tail -20 /var/log/setup-dc.log
+          echo '--- Container Status ---'
+          docker ps
+        "
+      shell: bash
+
+    - name: Run Setup Script
+      run: |
+        ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@${{ env.ip }} "cd /var/www && nohup ./setup-dc.sh > /var/log/setup-dc.log 2>&1 &"
+        echo "Setup script started. Waiting for completion..."
+        sleep 30
+        ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@${{ env.ip }} "tail -20 /var/log/setup-dc.log"
+      shell: bash
 
     - name: Open your Mautic instance
       run: |
