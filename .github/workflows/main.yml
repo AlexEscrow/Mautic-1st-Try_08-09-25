@@ -69,10 +69,10 @@ jobs:
         fi
 
     - name: Get VPS IP
-  run: |
-    IP="138.197.234.2"
-    echo "Using Reserved IP address: $IP"
-    echo "ip=$IP" >> $GITHUB_ENV
+      run: |
+        IP="138.197.234.2"
+        echo "Using Reserved IP address: $IP"
+        echo "ip=$IP" >> $GITHUB_ENV
 
     - name: Wait for server to be accessible
       run: |
