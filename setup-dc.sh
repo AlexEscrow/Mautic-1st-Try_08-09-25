@@ -1,6 +1,8 @@
+cat setup-dc.sh
+=== setup-dc.sh ===
 cd /var/www
-docker compose build
-docker compose up -d db --wait && docker compose up -d mautic_web --wait
+docker-compose build
+docker-compose up -d db --wait && docker-compose up -d mautic_web --wait
 
 echo "## Wait for basic-mautic_web-1 container to be fully running"
 while ! docker exec basic-mautic_web-1 sh -c 'echo "Container is running"'; do
@@ -9,7 +11,7 @@ while ! docker exec basic-mautic_web-1 sh -c 'echo "Container is running"'; do
 done
 
 echo "## Check if Mautic is installed"
-if docker compose exec -T mautic_web test -f /var/www/html/config/local.php && docker compose exec -T mautic_web grep -q "site_url" /var/www/html/config/local.php; then
+if docker-compose exec -T mautic_web test -f /var/www/html/config/local.php && docker-compose exec -T mautic_web grep -q "site_url" /var/www/html/config/local.php; then
     echo "## Mautic is installed already."
 else
     # Check if the container exists and is running
@@ -25,13 +27,13 @@ else
         echo "Container basic-mautic_worker-1 does not exist or is not running."
     fi
     echo "## Installing Mautic..."
-    docker compose exec -T -u www-data -w /var/www/html mautic_web php ./bin/console mautic:install --force --admin_email {{EMAIL_ADDRESS}} --admin_password {{MAUTIC_PASSWORD}} http://{{IP_ADDRESS}}:{{PORT}}
+    docker-compose exec -T -u www-data -w /var/www/html mautic_web php ./bin/console mautic:install --force --admin_email ContactUs+AutoCreatedAdmin@CallThatAgent.com --admin_password 0Mautic0@ http://138.197.199.81:8001
 fi
 
 echo "## Starting all the containers"
-docker compose up -d
+docker-compose up -d
 
-DOMAIN="{{DOMAIN_NAME}}"
+DOMAIN="engine.call-that.com"
 
 if [[ "$DOMAIN" == *"DOMAIN_NAME"* ]]; then
     echo "The DOMAIN variable is not set yet."
@@ -79,7 +81,7 @@ fi
 echo "## Configuring Let's Encrypt for $DOMAIN..."
 
 # Use Certbot with the Nginx plugin to obtain and install a certificate
-certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m {{EMAIL_ADDRESS}}
+certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m ContactUs+AutoCreatedAdmin@CallThatAgent.com
 
 # Nginx will be reloaded automatically by Certbot after obtaining the certificate
 echo "## Let's Encrypt configured for $DOMAIN"
@@ -93,12 +95,12 @@ else
 fi
 
 echo "## Check if Mautic is installed"
-if docker compose exec -T mautic_web test -f /var/www/html/config/local.php && docker compose exec -T mautic_web grep -q "site_url" /var/www/html/config/local.php; then
+if docker-compose exec -T mautic_web test -f /var/www/html/config/local.php && docker-compose exec -T mautic_web grep -q "site_url" /var/www/html/config/local.php; then
     echo "## Mautic is installed already."
     
     # Replace the site_url value with the domain
     echo "## Updating site_url in Mautic configuration..."
-    docker compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
+    docker-compose exec -T mautic_web sed -i "s|'site_url' => '.*',|'site_url' => 'https://$DOMAIN',|g" /var/www/html/config/local.php
 fi
 
 echo "## Script execution completed"
