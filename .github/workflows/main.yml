@@ -76,7 +76,7 @@ jobs:
           sleep 2
           STATUS=$(doctl compute droplet get mautic-vps --format Status --no-header)
           if [ "$STATUS" = "active" ]; then
-            IP=$(doctl compute droplet get mautic-vps --format PublicIPv4 --no-header)
+            IP=$(doctl compute droplet get mautic-vps --format IP=138.197.234.2 --no-header)
             if [ -n "$IP" ]; then
               echo "Droplet is active. IP address: $IP"
               break
