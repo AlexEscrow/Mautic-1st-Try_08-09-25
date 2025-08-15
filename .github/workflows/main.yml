@@ -189,10 +189,18 @@ jobs:
 
     - name: Run Setup Script
       run: |
+        # Create SSH key for connection
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
         ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@${{ env.ip }} "cd /var/www && nohup ./setup-dc.sh > /var/log/setup-dc.log 2>&1 &"
         echo "Setup script started. Waiting for completion..."
         sleep 30
         ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa root@${{ env.ip }} "tail -20 /var/log/setup-dc.log"
+        
+        # Clean up SSH key
+        rm -f ~/.ssh/id_rsa
       shell: bash
 
     - name: Open your Mautic instance
